@@ -46,8 +46,20 @@ internal static class Program
         var highlightOption = new Option<HighlightStyle>("--highlight", () => HighlightStyle.Mark,
             "How OneNote text highlighting is rendered: mark (<mark>...</mark>), equal (==...==), or none.");
 
+        var imagesFolderOption = new Option<string>("--images-folder", () => "images",
+            "Sub-folder name (within each page directory) that extracted images are written into.");
+
+        var attachmentsFolderOption = new Option<string>("--attachments-folder", () => "attachments",
+            "Sub-folder name (within each page directory) that extracted file attachments are written into.");
+
+        var indexNameOption = new Option<string>("--index-name", () => "_index.md",
+            "File name for a page's own content when it has sub-pages (stored inside the page's folder).");
+
+        var maxNameLengthOption = new Option<int>("--max-name-length", () => 120,
+            "Maximum length of a generated file/folder base name (before de-duplication suffixes).");
+
         var frontMatterOption = new Option<bool>("--front-matter",
-            "Emit a YAML front-matter block (title, timestamps, OneNote id, source path).");
+            "Emit a YAML front-matter block (title, timestamps, authors, OneNote id, source path).");
 
         var noTitleHeadingOption = new Option<bool>("--no-title-heading",
             "Do not emit the page title as a top-level heading.");
@@ -69,6 +81,7 @@ internal static class Program
             sectionOption, sectionLinkOption, outputOption, imagesOption, filenameStyleOption, subpagesOption,
             codeLanguageOption, frontMatterOption, noTitleHeadingOption, headingOffsetOption,
             overwriteOption, dryRunOption, verboseOption, highlightOption,
+            imagesFolderOption, attachmentsFolderOption, indexNameOption, maxNameLengthOption,
         };
 
         root.SetHandler((InvocationContext context) =>
@@ -84,6 +97,10 @@ internal static class Program
                 Subpages = parsed.GetValueForOption(subpagesOption),
                 CodeLanguage = parsed.GetValueForOption(codeLanguageOption)!,
                 Highlight = parsed.GetValueForOption(highlightOption),
+                ImagesFolder = parsed.GetValueForOption(imagesFolderOption)!,
+                AttachmentsFolder = parsed.GetValueForOption(attachmentsFolderOption)!,
+                IndexName = parsed.GetValueForOption(indexNameOption)!,
+                MaxNameLength = parsed.GetValueForOption(maxNameLengthOption),
                 FrontMatter = parsed.GetValueForOption(frontMatterOption),
                 TitleHeading = !parsed.GetValueForOption(noTitleHeadingOption),
                 HeadingOffset = parsed.GetValueForOption(headingOffsetOption),

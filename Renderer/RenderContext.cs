@@ -21,8 +21,18 @@ public sealed class RenderContext
     /// <summary>Whether to emit the page title as a top-level heading.</summary>
     public bool TitleHeading { get; init; } = true;
 
-    /// <summary>Sanitized page base name used as the prefix for extracted image files.</summary>
-    public required string ImageNamePrefix { get; init; }
+    /// <summary>
+    /// Allocates the relative file path (below the page directory, e.g. <c>images/003-Some Page.png</c>)
+    /// for the next extracted image with the given extension. The exporter owns naming and de-duplication
+    /// so numbering stays unique across every page sharing the folder.
+    /// </summary>
+    public Func<string, string>? ImageFileAllocator { get; init; }
+
+    /// <summary>
+    /// Allocates the relative file path (below the page directory, e.g. <c>attachments/notes.docx</c>)
+    /// for an embedded file with the given preferred name, de-duplicating within the folder.
+    /// </summary>
+    public Func<string, string>? AttachmentFileAllocator { get; init; }
 
     /// <summary>OneNote source path recorded in front matter.</summary>
     public string SourcePath { get; init; } = string.Empty;

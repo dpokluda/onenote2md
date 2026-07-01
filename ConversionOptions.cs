@@ -24,7 +24,7 @@ public sealed class ConversionOptions
     /// <summary>Whether to extract images or skip them.</summary>
     public ImageMode Images { get; init; } = ImageMode.Extract;
 
-    /// <summary>Emit a YAML front-matter block (title, timestamps, OneNote id, source path).</summary>
+    /// <summary>Emit a YAML front-matter block (title, timestamps, authors, OneNote id, source path).</summary>
     public bool FrontMatter { get; init; }
 
     /// <summary>Emit the page title as a top-level heading. Disable when front matter already carries it.</summary>
@@ -44,6 +44,21 @@ public sealed class ConversionOptions
 
     /// <summary>How OneNote text highlighting is rendered in Markdown.</summary>
     public HighlightStyle Highlight { get; init; } = HighlightStyle.Mark;
+
+    /// <summary>Sub-folder name (per page directory) that extracted images are written into.</summary>
+    public string ImagesFolder { get; init; } = "images";
+
+    /// <summary>Sub-folder name (per page directory) that extracted file attachments are written into.</summary>
+    public string AttachmentsFolder { get; init; } = "attachments";
+
+    /// <summary>
+    /// File name used for a page's own content when that page has sub-pages and is therefore stored
+    /// inside its own folder. The leading underscore of the default sorts it to the top of the folder.
+    /// </summary>
+    public string IndexName { get; init; } = "_index.md";
+
+    /// <summary>Maximum length of a generated file/folder base name before de-duplication suffixes.</summary>
+    public int MaxNameLength { get; init; } = 120;
 
     /// <summary>Overwrite existing files instead of failing when the output already has content.</summary>
     public bool Overwrite { get; init; }

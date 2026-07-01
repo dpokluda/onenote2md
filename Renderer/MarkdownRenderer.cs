@@ -49,7 +49,8 @@ public sealed class MarkdownRenderer
         var titleText = string.IsNullOrWhiteSpace(title) ? string.Empty : InlineHtmlToMarkdown(title).Trim();
 
         var images = new List<ExtractedImage>();
-        var state = new RenderState(ctx, styleMap, images);
+        var attachments = new List<ExtractedAttachment>();
+        var state = new RenderState(ctx, styleMap, images, attachments);
         var sb = new StringBuilder();
 
         if (ctx.FrontMatter)
@@ -70,22 +71,24 @@ public sealed class MarkdownRenderer
             }
         }
 
-        return new RenderedPage(sb.ToString().TrimEnd() + "\n", images);
+        return new RenderedPage(sb.ToString().TrimEnd() + "\n", images, attachments);
     }
 
     private sealed class RenderState
     {
-        public RenderState(RenderContext ctx, IReadOnlyDictionary<string, string> styleMap, List<ExtractedImage> images)
+        public RenderState(RenderContext ctx, IReadOnlyDictionary<string, string> styleMap,
+            List<ExtractedImage> images, List<ExtractedAttachment> attachments)
         {
             Ctx = ctx;
             StyleMap = styleMap;
             Images = images;
+            Attachments = attachments;
         }
 
         public RenderContext Ctx { get; }
         public IReadOnlyDictionary<string, string> StyleMap { get; }
         public List<ExtractedImage> Images { get; }
-        public int ImageCounter { get; set; }
+        public List<ExtractedAttachment> Attachments { get; }
     }
 
     private void RenderOeChildren(XElement oeChildren, RenderState state, StringBuilder sb, int depth)
@@ -119,6 +122,7 @@ public sealed class MarkdownRenderer
     {
         var table = oe.Element(One + "Table");
         var image = oe.Element(One + "Image");
+        var insertedFile = oe.Element(One + "InsertedFile");
 
         if (table is not null)
         {
@@ -130,6 +134,11 @@ public sealed class MarkdownRenderer
             EnsureBlankLine(sb);
             RenderImage(image, state, sb);
         }
+        else if (insertedFile is not null)
+        {
+            EnsureBlankLine(sb);
+            RenderInsertedFile(insertedFile, state, sb);
+        }
         else
         {
             var text = string.Concat(oe.Elements(One + "T").Select(t => InlineHtmlToMarkdown(t.Value))).Trim();
@@ -139,9 +148,7 @@ public sealed class MarkdownRenderer
 
             if (list is not null)
             {
-                var indent = new string(' ', depth * 2);
-                var marker = list.Element(One + "Number") is not null ? "1." : "-";
-                sb.Append(indent).Append(marker).Append(' ').Append(ToInlineBreaks(text)).Append('\n');
+                RenderListItem(list, text, sb, depth);
             }
             else if (IsHeading(styleName, out var level))
             {
@@ -152,7 +159,7 @@ public sealed class MarkdownRenderer
             else if (!string.IsNullOrEmpty(text))
             {
                 EnsureBlankLine(sb);
-                sb.Append(ToParagraphBreaks(text)).Append("\n\n");
+                sb.Append(ToParagraphBreaks(EscapeLeadingNumber(text))).Append("\n\n");
             }
         }
 
@@ -162,6 +169,59 @@ public sealed class MarkdownRenderer
             RenderOeChildren(children, state, sb, nextDepth);
         }
     }
+
+    // Spaces of indentation added per list-nesting level. Three aligns a nested item with the content
+    // column of a single-digit ordered parent ("1. "), which Markdown requires to treat it as nested.
+    private const int ListIndentUnit = 3;
+
+    // Renders one list item. OneNote gives us the exact authored marker via <one:List><one:Number text>.
+    // Numeric markers are emitted as real Markdown ordered items using their explicit number (so an
+    // interrupting block doesn't restart the count); bullets use '-'; alpha/roman markers (which Markdown
+    // cannot represent natively) are emitted as literal, hard-broken continuation lines.
+    private void RenderListItem(XElement list, string text, StringBuilder sb, int depth)
+    {
+        var indent = new string(' ', depth * ListIndentUnit);
+        var body = ToInlineBreaks(text);
+        var number = list.Element(One + "Number");
+
+        if (number is null)
+        {
+            sb.Append(indent).Append("- ").Append(body).Append('\n');
+            return;
+        }
+
+        var marker = ((string?)number.Attribute("text") ?? string.Empty).Trim();
+        if (IsNumericMarker(marker))
+        {
+            sb.Append(indent).Append(marker).Append(' ').Append(body).Append('\n');
+        }
+        else
+        {
+            var literal = marker.Length == 0 ? "-" : marker;
+            sb.Append(indent).Append(literal).Append(' ').Append(body).Append("  \n");
+        }
+    }
+
+    // A numeric ordered-list marker is one or more digits followed by '.' or ')', e.g. "1." or "2)".
+    private static bool IsNumericMarker(string marker) =>
+        marker.Length >= 2 &&
+        (marker[^1] is '.' or ')') &&
+        marker[..^1].All(char.IsDigit);
+
+    // Escapes a paragraph that begins with what looks like an ordered-list marker ("1.", "2)") so
+    // Markdown renders the literal number the author typed instead of turning it into an auto-numbered list.
+    private static string EscapeLeadingNumber(string text)
+    {
+        var match = LeadingNumber.Match(text);
+        if (!match.Success) return text;
+
+        var digits = match.Groups[1].Value;
+        var delimiter = match.Groups[2].Value;
+        return $"{digits}\\{delimiter}{text[match.Length..]}";
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex LeadingNumber =
+        new(@"^(\d+)([.)])(?=\s)", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     // Ensures the buffer ends with a blank line (when it already holds content), so the next block is
     // separated from a preceding list item; without it Markdown folds the block into the last bullet.
@@ -181,9 +241,7 @@ public sealed class MarkdownRenderer
 
     private void RenderImage(XElement image, RenderState state, StringBuilder sb)
     {
-        var alt = ((string?)image.Attribute("alt"))?.Trim() ?? string.Empty;
-
-        if (state.Ctx.Images == ImageMode.Skip)
+        if (state.Ctx.Images == ImageMode.Skip || state.Ctx.ImageFileAllocator is null)
         {
             return;
         }
@@ -201,17 +259,41 @@ public sealed class MarkdownRenderer
             return;
         }
 
-        state.ImageCounter++;
         var ext = NormalizeImageExtension((string?)image.Attribute("format"));
-        var descriptive = DescriptiveImageName(alt);
-        var baseName = descriptive ?? $"Image{state.ImageCounter:00}";
-        var fileName = $"{state.Ctx.ImageNamePrefix}_{baseName}.{ext}";
+        var relativePath = state.Ctx.ImageFileAllocator(ext);
+        state.Images.Add(new ExtractedImage(relativePath, bytes));
 
-        state.Images.Add(new ExtractedImage(fileName, bytes));
-
-        var link = fileName.Contains(' ') ? $"<{fileName}>" : fileName;
-        sb.Append("![").Append(baseName).Append("](").Append(link).Append(")\n\n");
+        var altText = EscapeLinkText(Path.GetFileNameWithoutExtension(relativePath));
+        sb.Append("![").Append(altText).Append("](").Append(ToAssetLink(relativePath)).Append(")\n\n");
     }
+
+    // Copies an embedded file (a OneNote InsertedFile) out via its local cache and links to it. The
+    // bytes live in 'pathCache', which OneNote populates when the page is fetched with binary data.
+    private void RenderInsertedFile(XElement file, RenderState state, StringBuilder sb)
+    {
+        var preferred = ((string?)file.Attribute("preferredName"))?.Trim();
+        if (string.IsNullOrWhiteSpace(preferred)) return;
+
+        var cache = (string?)file.Attribute("pathCache");
+        if (state.Ctx.AttachmentFileAllocator is null ||
+            string.IsNullOrWhiteSpace(cache) || !File.Exists(cache))
+        {
+            // The file was never cached locally (e.g. an un-synced page); keep a visible marker
+            // rather than emitting a link to a file we cannot write.
+            sb.Append("**[missing attachment: ").Append(EscapeLinkText(preferred)).Append("]**\n\n");
+            return;
+        }
+
+        var relativePath = state.Ctx.AttachmentFileAllocator(preferred);
+        state.Attachments.Add(new ExtractedAttachment(relativePath, cache));
+        sb.Append('[').Append(EscapeLinkText(preferred)).Append("](").Append(ToAssetLink(relativePath)).Append(")\n\n");
+    }
+
+    // Wraps a relative asset path in angle brackets when it contains spaces so the Markdown link parses.
+    private static string ToAssetLink(string relativePath) =>
+        relativePath.Contains(' ') ? $"<{relativePath}>" : relativePath;
+
+    private static string EscapeLinkText(string text) => text.Replace("[", "\\[").Replace("]", "\\]");
 
     private void RenderTable(XElement table, StringBuilder sb)
     {
@@ -248,10 +330,35 @@ public sealed class MarkdownRenderer
         var created = (string?)page?.Attribute("dateTime");
         var modified = (string?)page?.Attribute("lastModifiedTime");
 
+        // OneNote has no page-level author; authorship is recorded per outline element (<one:OE>).
+        // Derive the page creator from the earliest-created paragraph and the last editor from the
+        // most-recently-modified paragraph (falling back to its original author when OneNote did not
+        // record a distinct modifier). Times are ISO-8601 UTC, so ordinal string ordering is correct.
+        string? createdBy = null, modifiedBy = null;
+        var authoredOes = doc.Descendants(One + "OE")
+            .Where(e => e.Attribute("creationTime") != null)
+            .ToList();
+        if (authoredOes.Count > 0)
+        {
+            var firstCreated = authoredOes
+                .OrderBy(e => (string?)e.Attribute("creationTime"), StringComparer.Ordinal)
+                .First();
+            createdBy = (string?)firstCreated.Attribute("author");
+
+            var lastModified = authoredOes
+                .OrderByDescending(e => (string?)e.Attribute("lastModifiedTime"), StringComparer.Ordinal)
+                .First();
+            modifiedBy = (string?)lastModified.Attribute("lastModifiedBy");
+            if (string.IsNullOrEmpty(modifiedBy))
+                modifiedBy = (string?)lastModified.Attribute("author");
+        }
+
         sb.Append("---\n");
         sb.Append("title: ").Append(YamlScalar(titleText)).Append('\n');
         if (!string.IsNullOrEmpty(created)) sb.Append("created: ").Append(created).Append('\n');
+        if (!string.IsNullOrEmpty(createdBy)) sb.Append("created_by: ").Append(YamlScalar(createdBy)).Append('\n');
         if (!string.IsNullOrEmpty(modified)) sb.Append("modified: ").Append(modified).Append('\n');
+        if (!string.IsNullOrEmpty(modifiedBy)) sb.Append("modified_by: ").Append(YamlScalar(modifiedBy)).Append('\n');
         if (!string.IsNullOrEmpty(ctx.SourcePath)) sb.Append("source: ").Append(YamlScalar(ctx.SourcePath)).Append('\n');
         if (!string.IsNullOrEmpty(id)) sb.Append("onenote_id: ").Append(YamlScalar(id)).Append('\n');
         sb.Append("---\n\n");
@@ -285,22 +392,6 @@ public sealed class MarkdownRenderer
         string.Join("\n", oe.Elements(One + "T").Select(t => HtmlToPlainText(t.Value)));
 
     // ---- helpers (ported from onenote-mcp) ---------------------------------
-
-    // OneNote stores OCR'd text (not a real caption) in the image's alt attribute, so only treat
-    // it as a descriptive name when it is short and clean; otherwise fall back to Image{NN}.
-    private const int MaxDescriptiveImageNameLength = 40;
-
-    private static string? DescriptiveImageName(string alt)
-    {
-        if (string.IsNullOrWhiteSpace(alt)) return null;
-
-        var firstLine = alt.Replace("\r", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(firstLine)) return null;
-
-        var cleaned = new string(firstLine.Where(c => char.IsLetterOrDigit(c) || c is ' ' or '-' or '_').ToArray()).Trim();
-        if (string.IsNullOrEmpty(cleaned) || cleaned.Length > MaxDescriptiveImageNameLength) return null;
-        return cleaned;
-    }
 
     private static string NormalizeImageExtension(string? format)
     {
@@ -397,6 +488,7 @@ public sealed class MarkdownRenderer
             var style = child.GetAttributeValue("style", string.Empty).Replace(" ", string.Empty).ToLowerInvariant();
             var bold = name is "b" or "strong" || style.Contains("font-weight:bold") || style.Contains("font-weight:700");
             var italic = name is "i" or "em" || style.Contains("font-style:italic");
+            var strike = name is "s" or "strike" or "del" || style.Contains("text-decoration:line-through");
             var highlight = _highlight != HighlightStyle.None && IsHighlighted(style);
 
             var inner = new StringBuilder();
@@ -408,6 +500,7 @@ public sealed class MarkdownRenderer
             {
                 if (italic) content = $"*{content}*";
                 if (bold) content = $"**{content}**";
+                if (strike) content = $"~~{content}~~";
                 if (highlight) content = WrapHighlight(content, _highlight);
             }
             sb.Append(content);

@@ -8,7 +8,7 @@ namespace OneNote2Md;
 /// </summary>
 public static class FileNaming
 {
-    private const int MaxLength = 120;
+    private const int DefaultMaxLength = 120;
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -22,8 +22,9 @@ public static class FileNaming
     /// <summary>Produces a sanitized base name (no extension) from a OneNote title.</summary>
     /// <param name="title">The OneNote page, section, or group title to convert.</param>
     /// <param name="style">The naming style to apply.</param>
+    /// <param name="maxLength">Maximum length of the returned base name.</param>
     /// <returns>A filesystem-safe base name without an extension.</returns>
-    public static string ToBaseName(string title, FilenameStyle style)
+    public static string ToBaseName(string title, FilenameStyle style, int maxLength = DefaultMaxLength)
     {
         var name = style switch
         {
@@ -34,7 +35,7 @@ public static class FileNaming
 
         if (string.IsNullOrWhiteSpace(name)) name = "untitled";
 
-        if (name.Length > MaxLength) name = name[..MaxLength].TrimEnd();
+        if (maxLength > 0 && name.Length > maxLength) name = name[..maxLength].TrimEnd();
 
         // Windows rejects names ending in a dot or space.
         name = name.TrimEnd('.', ' ');
@@ -59,6 +60,41 @@ public static class FileNaming
         while (!used.Add(candidate.ToLowerInvariant()))
         {
             candidate = $"{baseName} ({counter})";
+            counter++;
+        }
+        return candidate;
+    }
+
+    /// <summary>Replaces characters invalid in a file name with underscores, preserving the extension.</summary>
+    /// <param name="fileName">The desired file name (including extension).</param>
+    /// <returns>A filesystem-safe file name.</returns>
+    public static string SanitizeFileName(string fileName)
+    {
+        var sb = new StringBuilder(fileName.Length);
+        foreach (var ch in fileName)
+        {
+            sb.Append(Array.IndexOf(InvalidChars, ch) >= 0 ? '_' : ch);
+        }
+        var cleaned = CollapseWhitespace(sb.ToString()).Trim().TrimEnd('.', ' ');
+        return string.IsNullOrWhiteSpace(cleaned) ? "attachment" : cleaned;
+    }
+
+    /// <summary>
+    /// Returns a unique file name within a folder by inserting " (2)", " (3)", ... before the
+    /// extension when the requested name is already taken.
+    /// </summary>
+    /// <param name="fileName">The desired file name (including extension).</param>
+    /// <param name="used">Set tracking file names already claimed in the folder (case-insensitive).</param>
+    /// <returns>A file name not yet present in <paramref name="used"/>.</returns>
+    public static string MakeUniqueFileName(string fileName, HashSet<string> used)
+    {
+        var ext = Path.GetExtension(fileName);
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var candidate = fileName;
+        var counter = 2;
+        while (!used.Add(candidate.ToLowerInvariant()))
+        {
+            candidate = $"{stem} ({counter}){ext}";
             counter++;
         }
         return candidate;

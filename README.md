@@ -2,7 +2,8 @@
 
 A small Windows console application that exports a **OneNote section** (or an entire
 **section group**) to a tree of local **Markdown files**, preserving the OneNote
-folder hierarchy and extracting embedded images alongside each page.
+folder hierarchy and extracting embedded images and file attachments alongside each
+page.
 
 It talks to the locally installed OneNote desktop client over **COM automation**
 (the same approach used by our companion `onenote-mcp` project), so no cloud
@@ -20,9 +21,12 @@ in OneNote on the same machine.
    - **section groups** → output folders
    - **sections** → output folders
    - **pages** → `.md` files
-   - **sub-pages** → a same-named folder *beside* the page's file (configurable)
+   - **pages that have sub-pages** → a folder named after the page, whose own content
+     is written inside it as an index file (`_index.md` by default) with the sub-pages
+     beside it (configurable)
 4. For each page, fetch its OneNote XML, render it to Markdown, and write any
-   embedded images next to the page file.
+   embedded images into an `images/` sub-folder and any file attachments into an
+   `attachments/` sub-folder next to the page file.
 5. Rewrite OneNote links that point at **another page in the same export** into
    relative Markdown links to that page's `.md` file (links to pages outside the
    export are left untouched).
@@ -41,19 +45,33 @@ structure beneath the requested path.
   do **not** match the COM hierarchy IDs, so the `.one` path and page name are used
   instead).
 - **Hierarchy preserved.** A section group exports as a nested folder tree; a single
-  section exports as one folder of pages. A page that has sub-pages is written as a
-  file with a same-named folder *beside* it holding the sub-pages, e.g.
-  `Investment.md` next to `Investment/Short-term safe money assets.md`.
+  section exports as one folder of pages. A page that has sub-pages becomes a folder
+  named after the page: the page's own content is written inside as `_index.md` (the
+  leading underscore sorts it to the top) and its sub-pages sit beside it, e.g.
+  `Investment/_index.md` next to `Investment/Short-term safe money assets.md`. The
+  index file name is configurable with `--index-name`.
 - **Readable filenames.** Page and folder names default to the OneNote title with
   spaces preserved (`This is a sample page.md`) because that is the most readable
   and is handled natively by Obsidian, VS Code, and other Markdown tools. Names are
   always sanitized for the filesystem (illegal characters removed, reserved names
   avoided, length capped, duplicates de-duplicated). A `--filename-style` switch
-  offers `kebab` or `snake` for users targeting static-site generators.
-- **Images next to the page.** Extracted images are written into the **same folder**
-  as their page and named `{PageName}_{ImageName}.{ext}`, falling back to
-  `{PageName}_Image{NN}.{ext}` when OneNote provides no descriptive name. Each extracted
-  image is shown beneath its page in the progress output (`Image: <file name>`).
+  offers `kebab` or `snake` for users targeting static-site generators. The length
+  cap is configurable with `--max-name-length` (default 120).
+- **Images in an `images/` sub-folder.** Extracted images are written into an
+  `images/` sub-folder next to their page and named `{NNN}-{page name}.{ext}`, where
+  `{NNN}` is a zero-padded counter that is unique *per folder*. The per-folder counter
+  guarantees every image gets a distinct file name (fixing collisions where OneNote
+  reuses image names). The sub-folder name is configurable with `--images-folder`.
+  Each extracted image is shown beneath its page in the progress output
+  (`Image: <file name>`).
+- **File attachments in an `attachments/` sub-folder.** Files inserted into a page
+  (`<one:InsertedFile>` — zips, `.docx`, `.eml`, `.xml`, etc.) are extracted
+  byte-for-byte into an `attachments/` sub-folder (created only when a page has
+  attachments) and linked inline with their original file name. Extracted files are
+  bit-identical to the originals, so a `.zip` remains a valid archive and a `.docx`
+  remains a valid Word document. The sub-folder name is configurable with
+  `--attachments-folder`. Each extracted attachment is shown beneath its page in the
+  progress output (`Attachment: <file name>`).
 - **Intra-export links rewritten.** When a page links to another page that is part of
   the same export, the OneNote link is replaced with a **relative** Markdown link to
   that page's `.md` file (path segments are percent-encoded, so spaces and characters
@@ -64,6 +82,14 @@ structure beneath the requested path.
   original OneNote link. Each rewritten link is shown beneath its page in the progress
   output (`Link to: <target page>`), and the total is reported in the final summary
   (`... , N link(s) rewritten`).
+- **Nested lists preserved.** OneNote list nesting (via `<one:OEChildren>`) is rendered
+  as indented Markdown. Numbered levels emit their **explicit** OneNote number so an
+  interrupting block (an image or paragraph inside a list) doesn't restart the
+  numbering; alphabetic/roman sub-levels (`a.`, `i.`) keep their literal marker.
+  Manually typed leading numbers in ordinary paragraphs are escaped so Markdown does
+  not silently renumber them.
+- **Inline formatting.** Bold, italic, and **strikethrough** (`~~…~~`, from OneNote's
+  `line-through` runs) are carried over, and compose with links and highlighting.
 - **Code blocks with a language.** Detected code paragraphs are emitted as fenced
   ```` ``` ```` blocks with a language hint. Because the source content is
   overwhelmingly KQL, the default language is `kql` (overridable).
@@ -72,7 +98,14 @@ structure beneath the requested path.
   by GitHub, VS Code, and Obsidian); `--highlight equal` instead emits `==…==`
   (Obsidian/Pandoc), and `--highlight none` drops the highlight and keeps the plain text.
 - **Configurable Markdown.** Front matter, the title heading, heading offset, and
-  sub-page layout are all switchable (see below).
+  sub-page layout are all switchable (see below). The optional YAML front matter
+  includes the page `title`, `created`/`modified` timestamps, `created_by`/`modified_by`
+  authors, the OneNote page id, and the source path. OneNote has no single page-author
+  field, so the authors are derived from paragraph-level authorship — `created_by` from
+  the earliest paragraph and `modified_by` from the most recently edited one — and each
+  is omitted when OneNote did not record it. (The `created`/`modified` timestamps come
+  from the page itself; a page's `modified` time can be newer than its last content edit
+  because OneNote also bumps it on sync.)
 - **Command line via `System.CommandLine`.** Arguments and switches are defined and
   parsed with the `System.CommandLine` NuGet package.
 
@@ -110,12 +143,16 @@ Specify the section to export with **exactly one** of `--section` or `--section-
 
 | Option                          | Default     | Description                                                                                  |
 | ------------------------------- | ----------- | -------------------------------------------------------------------------------------------- |
-| `--images <extract\|skip>`      | `extract`   | Extract embedded images next to each page, or drop them.                                      |
+| `--images <extract\|skip>`      | `extract`   | Extract embedded images into an `images/` sub-folder next to each page, or drop them. |
 | `--filename-style <preserve\|kebab\|snake>` | `preserve` | How page/folder names are derived from OneNote titles.                            |
-| `--subpages <folders\|flat>`    | `folders`   | Render OneNote sub-pages into a same-named folder beside the parent page's file, or flatten all pages into one folder. |
+| `--subpages <folders\|flat>`    | `folders`   | Render a page that has sub-pages as a folder (its own content in the index file, sub-pages beside it), or flatten all pages into one folder. |
+| `--images-folder <name>`        | `images`    | Name of the per-directory sub-folder that extracted images are written into.                  |
+| `--attachments-folder <name>`   | `attachments` | Name of the per-directory sub-folder that extracted file attachments are written into.       |
+| `--index-name <name>`           | `_index.md` | File name used for a parent page's own content inside its sub-page folder.                     |
+| `--max-name-length <n>`         | `120`       | Maximum length (characters) of a file/folder name derived from a OneNote title before de-duplication. |
 | `--code-language <lang>`        | `kql`       | Language hint applied to fenced code blocks.                                                  |
 | `--highlight <mark\|equal\|none>` | `mark`    | How OneNote text highlighting is rendered: `mark` (`<mark>…</mark>`), `equal` (`==…==`), or `none` (plain text). |
-| `--front-matter`                | off         | Emit a YAML front-matter block (title, created/modified, OneNote id, source path).            |
+| `--front-matter`                | off         | Emit a YAML front-matter block (title, created/modified timestamps and authors, OneNote id, source path). |
 | `--no-title-heading`            | off         | Do not emit the page title as a top-level `#` heading (useful with `--front-matter`).         |
 | `--heading-offset <n>`          | `1`         | Amount added to OneNote heading levels (OneNote `h1` becomes `#` × (n+1)).                     |
 | `--overwrite`                   | off         | Overwrite existing files instead of failing when the output already contains content.         |

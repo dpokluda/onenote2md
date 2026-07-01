@@ -18,8 +18,10 @@ public sealed class Exporter
     private string _outputDir = string.Empty;
     private int _pageCount;
     private int _imageCount;
+    private int _attachmentCount;
     private int _linkCount;
     private int _totalPages;
+    private readonly string _indexBaseName;
 
     // Maps (section .one URL, page name) -> absolute output .md path for every exported page, so
     // intra-export OneNote links can be rewritten to relative Markdown paths.
@@ -37,8 +39,20 @@ public sealed class Exporter
         _options = options;
         _log = log;
 
+        _indexBaseName = Path.GetFileNameWithoutExtension(options.IndexName);
+        if (string.IsNullOrWhiteSpace(_indexBaseName)) _indexBaseName = "_index";
+
         // Per-page progress lines are for non-verbose runs; verbose/dry-run use _log instead.
         _showInlineProgress = !options.Verbose && !options.DryRun;
+    }
+
+    // Per-directory naming state shared by every page written into that directory: a running image
+    // counter (keeps image file names unique across pages in the folder) and the set of attachment
+    // file names already claimed there.
+    private sealed class FolderAssets
+    {
+        public int ImageCounter { get; set; }
+        public HashSet<string> AttachmentNames { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>Counts the sections (including nested ones) contained in a node.</summary>
@@ -102,9 +116,10 @@ public sealed class Exporter
                 break;
         }
 
-        ConsoleEx.WriteLine("Processed {0} page(s){1}, {2} link(s) rewritten{3}.",
+        ConsoleEx.WriteLine("Processed {0} page(s){1}{2}, {3} link(s) rewritten{4}.",
             _pageCount,
             _options.Images == ImageMode.Extract ? $", {_imageCount} image(s)" : string.Empty,
+            _attachmentCount > 0 ? $", {_attachmentCount} attachment(s)" : string.Empty,
             _linkCount,
             _options.DryRun ? " (dry run, nothing written)" : string.Empty);
     }
@@ -115,7 +130,7 @@ public sealed class Exporter
 
         foreach (var section in group.Sections)
         {
-            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(section.Name, _options.FilenameStyle), used);
+            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(section.Name, _options.FilenameStyle, _options.MaxNameLength), used);
             var folderPath = Path.Combine(dir, folderName);
             EnsureDirectory(folderPath);
             ExportSectionPages(section, folderPath, $"{sourcePath}/{section.Name}");
@@ -123,7 +138,7 @@ public sealed class Exporter
 
         foreach (var child in group.Groups)
         {
-            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(child.Name, _options.FilenameStyle), used);
+            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(child.Name, _options.FilenameStyle, _options.MaxNameLength), used);
             var folderPath = Path.Combine(dir, folderName);
             EnsureDirectory(folderPath);
             ExportGroup(child, folderPath, $"{sourcePath}/{child.Name}");
@@ -143,45 +158,63 @@ public sealed class Exporter
 
     private void ExportPages(IReadOnlyList<PageNode> pages, string dir, string sourcePath)
     {
+        var assets = new FolderAssets();
+
         if (_options.Subpages == SubpageLayout.Flat)
         {
             var used = new HashSet<string>();
             foreach (var page in Flatten(pages))
             {
-                var name = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle), used);
-                WritePage(page, dir, name, $"{sourcePath}/{page.Name}");
+                var name = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle, _options.MaxNameLength), used);
+                WritePage(page, dir, name, PagePrefix(name), $"{sourcePath}/{page.Name}", assets);
             }
         }
         else
         {
-            ExportPagesAsFolders(pages, dir, sourcePath, new HashSet<string>());
+            ExportFolderLevel(pages, dir, sourcePath, assets, new HashSet<string>());
         }
     }
 
-    // Writes each page as a file in the current folder; a page that has sub-pages additionally gets a
-    // same-named folder beside its file, into which its sub-pages are written (recursively).
-    private void ExportPagesAsFolders(IReadOnlyList<PageNode> pages, string dir, string sourcePath, HashSet<string> used)
+    // Writes each page in 'dir'. A page that has sub-pages instead becomes a folder: its own content is
+    // written inside that folder as the index file (see --index-name) and its sub-pages are written
+    // beside the index (recursively), sharing the folder's image/attachment naming state.
+    private void ExportFolderLevel(IReadOnlyList<PageNode> pages, string dir, string sourcePath, FolderAssets assets, HashSet<string> used)
     {
         foreach (var page in pages)
         {
-            var baseName = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle), used);
+            var baseName = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle, _options.MaxNameLength), used);
             var pageSource = $"{sourcePath}/{page.Name}";
-
-            WritePage(page, dir, baseName, pageSource);
 
             if (page.SubPages.Count > 0)
             {
                 var folderPath = Path.Combine(dir, baseName);
                 EnsureDirectory(folderPath);
-                ExportPagesAsFolders(page.SubPages, folderPath, pageSource, new HashSet<string>());
+
+                var folderAssets = new FolderAssets();
+                var folderUsed = new HashSet<string>();
+                var indexName = FileNaming.MakeUnique(_indexBaseName, folderUsed);
+
+                WritePage(page, folderPath, indexName, PagePrefix(baseName), pageSource, folderAssets);
+                ExportFolderLevel(page.SubPages, folderPath, pageSource, folderAssets, folderUsed);
+            }
+            else
+            {
+                WritePage(page, dir, baseName, PagePrefix(baseName), pageSource, assets);
             }
         }
     }
 
-    private void WritePage(PageNode page, string dir, string baseName, string sourcePath)
+    // First 20 characters of a page's base name, used to make extracted asset file names readable.
+    private static string PagePrefix(string baseName)
+    {
+        var prefix = baseName.Length <= 20 ? baseName : baseName[..20];
+        return prefix.TrimEnd(' ', '.');
+    }
+
+    private void WritePage(PageNode page, string dir, string fileBaseName, string pagePrefix, string sourcePath, FolderAssets assets)
     {
         _pageCount++;
-        var filePath = Path.Combine(dir, baseName + ".md");
+        var filePath = Path.Combine(dir, fileBaseName + ".md");
 
         ReportPageProgress(page.Name);
 
@@ -199,8 +232,9 @@ public sealed class Exporter
             Images = _options.Images,
             FrontMatter = _options.FrontMatter,
             TitleHeading = _options.TitleHeading,
-            ImageNamePrefix = baseName,
             SourcePath = sourcePath,
+            ImageFileAllocator = ext => AllocateImage(assets, pagePrefix, ext),
+            AttachmentFileAllocator = name => AllocateAttachment(assets, name),
             LinkResolver = href => ResolveInternalLink(href, filePath),
         });
 
@@ -213,19 +247,59 @@ public sealed class Exporter
         foreach (var image in rendered.Images)
         {
             _imageCount++;
-            var imagePath = Path.Combine(dir, image.FileName);
-            ReportImageProgress(image.FileName);
+            var imagePath = Path.Combine(dir, ToLocalPath(image.FileName));
+            ReportAssetProgress("Image", image.FileName);
             if (_options.DryRun)
             {
                 _log($"    image: {Relative(imagePath)}");
             }
             else
             {
+                Directory.CreateDirectory(Path.GetDirectoryName(imagePath)!);
                 File.WriteAllBytes(imagePath, image.Data);
                 _log($"    wrote image: {Relative(imagePath)}");
             }
         }
+
+        foreach (var attachment in rendered.Attachments)
+        {
+            _attachmentCount++;
+            var attachmentPath = Path.Combine(dir, ToLocalPath(attachment.FileName));
+            ReportAssetProgress("Attachment", attachment.FileName);
+            if (_options.DryRun)
+            {
+                _log($"    attachment: {Relative(attachmentPath)}");
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(attachmentPath)!);
+                File.Copy(attachment.SourceCachePath, attachmentPath, overwrite: true);
+                _log($"    wrote attachment: {Relative(attachmentPath)}");
+            }
+        }
     }
+
+    // Allocates the next unique image file name within a folder: "<NNN>-<page prefix>.<ext>" under the
+    // images sub-folder. The per-folder counter guarantees uniqueness regardless of the page prefix.
+    private string AllocateImage(FolderAssets assets, string pagePrefix, string ext)
+    {
+        assets.ImageCounter++;
+        var name = $"{assets.ImageCounter:000}-{pagePrefix}.{ext}";
+        return $"{_options.ImagesFolder}/{name}";
+    }
+
+    // Allocates a unique, sanitized attachment file name (keeping the original preferred name) under
+    // the attachments sub-folder.
+    private string AllocateAttachment(FolderAssets assets, string preferredName)
+    {
+        var safe = FileNaming.SanitizeFileName(preferredName);
+        var unique = FileNaming.MakeUniqueFileName(safe, assets.AttachmentNames);
+        return $"{_options.AttachmentsFolder}/{unique}";
+    }
+
+    // Converts a '/'-separated relative asset path into a platform path for combining/writing.
+    private static string ToLocalPath(string relativePath) =>
+        relativePath.Replace('/', Path.DirectorySeparatorChar);
 
     // Prints one progress line per page (interactive runs only); verbose/dry-run rely on _log.
     private void ReportPageProgress(string title)
@@ -304,13 +378,13 @@ public sealed class Exporter
         }
     }
 
-    // Reports an extracted image beneath the page currently being exported (inline runs only;
-    // verbose/dry-run runs already log image paths via _log).
-    private void ReportImageProgress(string fileName)
+    // Reports an extracted image or attachment beneath the page currently being exported (inline runs
+    // only; verbose/dry-run runs already log asset paths via _log).
+    private void ReportAssetProgress(string kind, string fileName)
     {
         if (_showInlineProgress)
         {
-            ConsoleEx.WriteLine("    Image: {0}", Truncate(fileName, 60));
+            ConsoleEx.WriteLine("    {0}: {1}", kind, Truncate(fileName, 60));
         }
     }
 
@@ -350,13 +424,13 @@ public sealed class Exporter
 
         foreach (var section in group.Sections)
         {
-            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(section.Name, _options.FilenameStyle), used);
+            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(section.Name, _options.FilenameStyle, _options.MaxNameLength), used);
             IndexPages(section.Pages, Path.Combine(dir, folderName), index);
         }
 
         foreach (var child in group.Groups)
         {
-            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(child.Name, _options.FilenameStyle), used);
+            var folderName = FileNaming.MakeUnique(FileNaming.ToBaseName(child.Name, _options.FilenameStyle, _options.MaxNameLength), used);
             IndexGroup(child, Path.Combine(dir, folderName), index);
         }
     }
@@ -368,26 +442,36 @@ public sealed class Exporter
             var used = new HashSet<string>();
             foreach (var page in Flatten(pages))
             {
-                var name = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle), used);
+                var name = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle, _options.MaxNameLength), used);
                 AddToIndex(index, page, Path.Combine(dir, name + ".md"));
             }
         }
         else
         {
-            IndexPagesAsFolders(pages, dir, index, new HashSet<string>());
+            IndexFolderLevel(pages, dir, index, new HashSet<string>());
         }
     }
 
-    private void IndexPagesAsFolders(IReadOnlyList<PageNode> pages, string dir, Dictionary<(string, string), string> index, HashSet<string> used)
+    // Mirrors ExportFolderLevel's naming/layout so every page maps to the exact file the writer produces:
+    // a page with sub-pages lives at <folder>/<index-name>.md, its sub-pages beside it.
+    private void IndexFolderLevel(IReadOnlyList<PageNode> pages, string dir, Dictionary<(string, string), string> index, HashSet<string> used)
     {
         foreach (var page in pages)
         {
-            var baseName = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle), used);
-            AddToIndex(index, page, Path.Combine(dir, baseName + ".md"));
+            var baseName = FileNaming.MakeUnique(FileNaming.ToBaseName(page.Name, _options.FilenameStyle, _options.MaxNameLength), used);
 
             if (page.SubPages.Count > 0)
             {
-                IndexPagesAsFolders(page.SubPages, Path.Combine(dir, baseName), index, new HashSet<string>());
+                var folderPath = Path.Combine(dir, baseName);
+                var folderUsed = new HashSet<string>();
+                var indexName = FileNaming.MakeUnique(_indexBaseName, folderUsed);
+
+                AddToIndex(index, page, Path.Combine(folderPath, indexName + ".md"));
+                IndexFolderLevel(page.SubPages, folderPath, index, folderUsed);
+            }
+            else
+            {
+                AddToIndex(index, page, Path.Combine(dir, baseName + ".md"));
             }
         }
     }
