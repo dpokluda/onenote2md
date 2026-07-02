@@ -61,8 +61,11 @@ structure beneath the requested path.
   `images/` sub-folder next to their page and named `{NNN}-{page name}.{ext}`, where
   `{NNN}` is a zero-padded counter that is unique *per folder*. The per-folder counter
   guarantees every image gets a distinct file name (fixing collisions where OneNote
-  reuses image names). The sub-folder name is configurable with `--images-folder`.
-  Each extracted image is shown beneath its page in the progress output
+  reuses image names). The `{page name}` portion is simplified to letters, digits,
+  spaces, `-` and `_` (brackets, parentheses and other punctuation are dropped) so the
+  file name stays clean and the Markdown image link always parses, even for pages whose
+  titles contain characters like `[` or `]`. The sub-folder name is configurable with
+  `--images-folder`. Each extracted image is shown beneath its page in the progress output
   (`Image: <file name>`).
 - **File attachments in an `attachments/` sub-folder.** Files inserted into a page
   (`<one:InsertedFile>` — zips, `.docx`, `.eml`, `.xml`, etc.) are extracted
@@ -82,17 +85,35 @@ structure beneath the requested path.
   original OneNote link. Each rewritten link is shown beneath its page in the progress
   output (`Link to: <target page>`), and the total is reported in the final summary
   (`... , N link(s) rewritten`).
-- **Nested lists preserved.** OneNote list nesting (via `<one:OEChildren>`) is rendered
-  as indented Markdown. Numbered levels emit their **explicit** OneNote number so an
-  interrupting block (an image or paragraph inside a list) doesn't restart the
-  numbering; alphabetic/roman sub-levels (`a.`, `i.`) keep their literal marker.
-  Manually typed leading numbers in ordinary paragraphs are escaped so Markdown does
-  not silently renumber them.
+- **Nested lists as a flattened outline.** OneNote list nesting (via `<one:OEChildren>`)
+  is rendered as flat paragraph lines with computed, literal outline markers rather than
+  as real Markdown lists. This is deliberate: real Markdown lists require blocks nested
+  inside an item (code fences, images) to be indented to the item's content column, which
+  renderers handle inconsistently and which caused nesting and numbering to break whenever
+  a code block appeared inside a list. With the flattened model each item is an ordinary
+  line, so an interleaved code block or image renders normally and can never restart or
+  swallow the list. Markers are:
+  - **Bullets** by depth — `*`, `**`, `***`, … (emitted escaped as `\*` so the asterisks
+    show literally instead of creating a Markdown bullet or bold run).
+  - **Numbers** as a hierarchical path built from OneNote's per-level markers — `1`,
+    `1.1`, `1.a`, `2.3.b`, etc.
+
+  Levels are also lightly indented with non-breaking spaces (`&nbsp;`) so the outline
+  reads as nested without tripping Markdown's indented-code-block rule. Manually typed
+  leading numbers in ordinary paragraphs (pages where the author typed `1.`, `2.` as text
+  rather than using OneNote's list feature) are escaped so Markdown does not renumber them.
 - **Inline formatting.** Bold, italic, and **strikethrough** (`~~…~~`, from OneNote's
   `line-through` runs) are carried over, and compose with links and highlighting.
-- **Code blocks with a language.** Detected code paragraphs are emitted as fenced
-  ```` ``` ```` blocks with a language hint. Because the source content is
-  overwhelmingly KQL, the default language is `kql` (overridable).
+- **Code blocks with a language.** Code paragraphs are emitted as fenced
+  ```` ``` ```` blocks with a language hint. Detection combines several signals, because
+  OneNote records no semantic "code" marker and authors style snippets inconsistently: a
+  monospace font on the paragraph, KQL pipe lines (and a query's leading table/operator
+  line — even when OneNote glued it to the end of the preceding prose paragraph rather than
+  giving it its own line), and JSON objects (a `{`/`[` opener whose braces balance and that
+  contains a quoted key such as `"name":`, so bracketed prose like `[ARM only]:` is left
+  alone). Adjacent code-like lines are grouped into a single fence. Because the source
+  content is overwhelmingly KQL, the default language is `kql` (overridable); blocks that
+  look like JSON are labelled `json` automatically.
 - **Text highlighting.** OneNote stores a highlighter mark as a (non-white) background
   color on the text run. By default these are emitted as `<mark>…</mark>` (HTML, rendered
   by GitHub, VS Code, and Obsidian); `--highlight equal` instead emits `==…==`
@@ -118,13 +139,13 @@ structure beneath the requested path.
 
 ## Build
 
-```bash
+```sh
 dotnet build onenote2md.sln
 ```
 
 ## Usage
 
-```bash
+```sh
 onenote2md --section "<OneNote path>" --output "<folder>" [options]
 onenote2md --section-link "<OneNote copy-link>" --output "<folder>" [options]
 ```
@@ -163,13 +184,13 @@ Specify the section to export with **exactly one** of `--section` or `--section-
 
 Export a whole section group, preserving hierarchy and extracting images:
 
-```bash
+```sh
 onenote2md --section "Azure Policy Livesite Handoff/2026 Weekly Summaries" --output ".\export"
 ```
 
 Export a single TSG section with YAML front matter and no duplicate H1 title:
 
-```bash
+```sh
 onenote2md --section "Governance Vteam Notebook/Policy/On-Call" --output ".\tsg" --front-matter --no-title-heading
 ```
 
@@ -177,7 +198,7 @@ Export by pasting a OneNote **Copy Link** instead of typing the path. A link to 
 section exports the whole section; a link to a page exports just that page and its
 sub-pages:
 
-```bash
+```sh
 # Whole section (link copied from a section tab)
 onenote2md --section-link "onenote:https://contoso.sharepoint.com/.../On-Call.one&section-id={...}&end" --output ".\tsg"
 
@@ -187,13 +208,13 @@ onenote2md --section-link "onenote:https://contoso.sharepoint.com/.../On-Call.on
 
 Preview the structure without writing files:
 
-```bash
+```sh
 onenote2md --section "Governance Vteam Notebook/Policy" --output ".\out" --dry-run
 ```
 
 Produce static-site-friendly filenames and skip images:
 
-```bash
+```sh
 onenote2md --section "Governance Vteam Notebook/Policy/On-Call" --output ".\site" --filename-style kebab --images skip
 ```
 

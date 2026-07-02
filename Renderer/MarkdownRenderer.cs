@@ -89,6 +89,10 @@ public sealed class MarkdownRenderer
         public IReadOnlyDictionary<string, string> StyleMap { get; }
         public List<ExtractedImage> Images { get; }
         public List<ExtractedAttachment> Attachments { get; }
+
+        // Tracks the current ordered-list marker token at each nesting depth (null for bullet levels),
+        // used to build hierarchical numbers like "1.1" or "1.a" for the flattened outline.
+        public List<string?> NumberStack { get; } = new();
     }
 
     private void RenderOeChildren(XElement oeChildren, RenderState state, StringBuilder sb, int depth)
@@ -98,19 +102,22 @@ public sealed class MarkdownRenderer
         {
             var oe = items[i];
 
-            // Group consecutive monospace paragraphs into a single fenced code block.
-            if (IsCodeParagraph(oe))
+            // Group a run of code-like paragraphs (monospace font, KQL pipe lines, or a JSON object)
+            // into a single fenced block. Advances i to the last line consumed.
+            if (TryMatchCodeBlock(items, state.Ctx.CodeLanguage, ref i, out var codeLines, out var lang))
             {
-                var lines = new List<string>();
-                while (i < items.Count && IsCodeParagraph(items[i]))
+                // A KQL query's opening table/operator line is often glued to the end of the preceding
+                // prose paragraph (via a soft line break) rather than being its own OE, so a pipe-anchored
+                // block loses its first line. If so, reclaim that trailing line from the emitted output.
+                if (codeLines.Count > 0 && codeLines[0].TrimStart().StartsWith("|") &&
+                    TryReclaimKqlHead(sb, out var head))
                 {
-                    lines.Add(CodeText(items[i]));
-                    i++;
+                    codeLines.Insert(0, head);
                 }
-                i--; // step back; the for-loop will advance past the last code line
 
-                sb.Append("```").Append(state.Ctx.CodeLanguage).Append('\n');
-                sb.Append(string.Join("\n", lines).TrimEnd()).Append("\n```\n\n");
+                EnsureBlankLine(sb);
+                sb.Append("```").Append(lang).Append('\n');
+                sb.Append(string.Join("\n", codeLines).TrimEnd()).Append("\n```\n\n");
                 continue;
             }
 
@@ -148,7 +155,7 @@ public sealed class MarkdownRenderer
 
             if (list is not null)
             {
-                RenderListItem(list, text, sb, depth);
+                RenderListItem(list, text, state, sb, depth);
             }
             else if (IsHeading(styleName, out var level))
             {
@@ -170,43 +177,66 @@ public sealed class MarkdownRenderer
         }
     }
 
-    // Spaces of indentation added per list-nesting level. Three aligns a nested item with the content
-    // column of a single-digit ordered parent ("1. "), which Markdown requires to treat it as nested.
-    private const int ListIndentUnit = 3;
+    // Visual indentation added per outline-nesting level. Non-breaking spaces render as real indentation
+    // in HTML while never reaching the 4-space threshold that would turn a line into an indented code block.
+    private const string ListIndentUnit = "&nbsp;&nbsp;";
 
-    // Renders one list item. OneNote gives us the exact authored marker via <one:List><one:Number text>.
-    // Numeric markers are emitted as real Markdown ordered items using their explicit number (so an
-    // interrupting block doesn't restart the count); bullets use '-'; alpha/roman markers (which Markdown
-    // cannot represent natively) are emitted as literal, hard-broken continuation lines.
-    private void RenderListItem(XElement list, string text, StringBuilder sb, int depth)
+    // Renders one outline item as a plain, flattened paragraph line with a computed literal marker,
+    // rather than a real Markdown list item. This keeps nesting and (crucially) intra-item code blocks
+    // and images robust: each item is an ordinary line, so a code fence between items renders normally
+    // and can never be swallowed by, or restart, a Markdown list.
+    //   - Bullets:  depth 1 => "*", depth 2 => "**", depth 3 => "***"  (emitted escaped as \* so Markdown
+    //               shows the asterisks literally instead of creating a bullet or bold text).
+    //   - Numbered: a hierarchical path built from OneNote's per-level markers, e.g. "1", "1.1", "1.a".
+    private void RenderListItem(XElement list, string text, RenderState state, StringBuilder sb, int depth)
     {
-        var indent = new string(' ', depth * ListIndentUnit);
+        var indent = string.Concat(Enumerable.Repeat(ListIndentUnit, depth));
         var body = ToInlineBreaks(text);
         var number = list.Element(One + "Number");
 
+        string marker;
         if (number is null)
         {
-            sb.Append(indent).Append("- ").Append(body).Append('\n');
-            return;
-        }
-
-        var marker = ((string?)number.Attribute("text") ?? string.Empty).Trim();
-        if (IsNumericMarker(marker))
-        {
-            sb.Append(indent).Append(marker).Append(' ').Append(body).Append('\n');
+            // Bullet level: record a null token so nested numbered items skip this level in their path.
+            SetListMarker(state.NumberStack, depth, null);
+            marker = string.Concat(Enumerable.Repeat("\\*", depth + 1));
         }
         else
         {
-            var literal = marker.Length == 0 ? "-" : marker;
-            sb.Append(indent).Append(literal).Append(' ').Append(body).Append("  \n");
+            var token = StripMarkerPunctuation((string?)number.Attribute("text"));
+            SetListMarker(state.NumberStack, depth, token);
+            marker = string.Join(".", state.NumberStack.Take(depth + 1).Where(t => !string.IsNullOrEmpty(t)));
+            if (marker.Length == 0) marker = token;
         }
+
+        sb.Append(indent).Append(marker).Append(' ').Append(body).Append("  \n");
     }
 
-    // A numeric ordered-list marker is one or more digits followed by '.' or ')', e.g. "1." or "2)".
-    private static bool IsNumericMarker(string marker) =>
-        marker.Length >= 2 &&
-        (marker[^1] is '.' or ')') &&
-        marker[..^1].All(char.IsDigit);
+    // Records the marker 'token' (or null for a bullet) at the given nesting depth, discarding any deeper
+    // levels so a later item at a shallower depth rebuilds its number path correctly.
+    private static void SetListMarker(List<string?> stack, int depth, string? token)
+    {
+        if (stack.Count > depth + 1)
+        {
+            stack.RemoveRange(depth + 1, stack.Count - (depth + 1));
+        }
+        while (stack.Count <= depth)
+        {
+            stack.Add(null);
+        }
+        stack[depth] = token;
+    }
+
+    // Strips a single trailing '.' or ')' from a OneNote list marker (e.g. "1." => "1", "a)" => "a").
+    private static string StripMarkerPunctuation(string? marker)
+    {
+        var m = (marker ?? string.Empty).Trim();
+        if (m.Length > 0 && (m[^1] is '.' or ')'))
+        {
+            m = m[..^1];
+        }
+        return m;
+    }
 
     // Escapes a paragraph that begins with what looks like an ordered-list marker ("1.", "2)") so
     // Markdown renders the literal number the author typed instead of turning it into an auto-numbered list.
@@ -222,6 +252,10 @@ public sealed class MarkdownRenderer
 
     private static readonly System.Text.RegularExpressions.Regex LeadingNumber =
         new(@"^(\d+)([.)])(?=\s)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // A quoted JSON key (`"name":`), the signal that distinguishes real JSON from bracketed prose.
+    private static readonly System.Text.RegularExpressions.Regex JsonKey =
+        new("\"[^\"\\r\\n]*\"\\s*:", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     // Ensures the buffer ends with a blank line (when it already holds content), so the next block is
     // separated from a preceding list item; without it Markdown folds the block into the last bullet.
@@ -289,9 +323,14 @@ public sealed class MarkdownRenderer
         sb.Append('[').Append(EscapeLinkText(preferred)).Append("](").Append(ToAssetLink(relativePath)).Append(")\n\n");
     }
 
-    // Wraps a relative asset path in angle brackets when it contains spaces so the Markdown link parses.
+    // Characters that break a Markdown inline-link destination when left bare. Wrapping the path in
+    // angle brackets (<...>) lets CommonMark parse spaces and (), [] literally.
+    private static readonly char[] LinkUnsafeChars = { ' ', '(', ')', '[', ']' };
+
+    // Wraps a relative asset path in angle brackets when it contains characters that would otherwise
+    // break the Markdown link so the destination parses correctly.
     private static string ToAssetLink(string relativePath) =>
-        relativePath.Contains(' ') ? $"<{relativePath}>" : relativePath;
+        relativePath.IndexOfAny(LinkUnsafeChars) >= 0 ? $"<{relativePath}>" : relativePath;
 
     private static string EscapeLinkText(string text) => text.Replace("[", "\\[").Replace("]", "\\]");
 
@@ -369,9 +408,88 @@ public sealed class MarkdownRenderer
 
     // ---- code detection ----------------------------------------------------
 
-    // A paragraph counts as code when it is plain text rendered in a monospace font and has no
-    // list marker, table, image, or nested children.
-    private static bool IsCodeParagraph(XElement oe)
+    // OneNote records no semantic "code" marker; the only reliable native signal is a monospace font.
+    // In practice authors apply it inconsistently, so on top of the font signal we also recognize KQL
+    // pipe lines and JSON objects by content, and group adjacent code-like lines into one fenced block.
+
+    // Attempts to consume a fenced code block starting at items[i]. On success, sets 'lines' to the block
+    // body, 'lang' to the fence language, advances 'i' to the last consumed item, and returns true.
+    private bool TryMatchCodeBlock(List<XElement> items, string defaultLang, ref int i,
+        out List<string> lines, out string lang)
+    {
+        lines = new List<string>();
+        lang = defaultLang;
+
+        int start = i;
+        if (!IsTextParagraph(items[start])) return false;
+
+        var startTrim = ParagraphText(items[start]).TrimStart();
+        var mono = IsMonospaceParagraph(items[start]);
+        var pipe = startTrim.StartsWith("|");
+        var jsonOpen = startTrim.Length > 0 && (startTrim[0] is '{' or '[');
+
+        // A KQL query's first line (a table name or operator like `union X`) has no leading pipe, so it
+        // would otherwise leak out above the block. Treat it as an anchor when the next line is a pipe.
+        var nextPipe = start + 1 < items.Count && IsTextParagraph(items[start + 1]) &&
+                       ParagraphText(items[start + 1]).TrimStart().StartsWith("|");
+        var kqlHead = nextPipe && IsKqlHead(startTrim);
+
+        // A block may only START on a strong anchor: monospace text, a KQL pipe/head line, or a JSON opener.
+        if (!(mono || pipe || jsonOpen || kqlHead)) return false;
+
+        var collected = new List<string>();
+        int j = start;
+
+        if (jsonOpen && !mono && !pipe)
+        {
+            // Plain-font JSON: consume until the braces balance. Require a quoted key (`"name":`) rather
+            // than any colon so bracketed prose like `[ARM only]:` or `Entity:Diagnostics` isn't fenced.
+            int balance = 0;
+            for (; j < items.Count; j++)
+            {
+                if (!IsTextParagraph(items[j])) break;
+                var txt = ParagraphText(items[j]);
+                if (j > start && !(IsMonospaceParagraph(items[j]) || IsJsonLine(txt.TrimStart()))) break;
+
+                collected.Add(txt);
+                foreach (var c in txt)
+                {
+                    if (c is '{' or '[') balance++;
+                    else if (c is '}' or ']') balance--;
+                }
+                if (balance <= 0) { j++; break; }
+            }
+            if (collected.Count == 0 || !JsonKey.IsMatch(string.Join("\n", collected))) return false;
+        }
+        else
+        {
+            // Monospace / KQL run: the anchor line (start) is always taken; then keep consuming adjacent
+            // code-like lines (monospace, pipe, or JSON-ish).
+            for (; j < items.Count; j++)
+            {
+                if (!IsTextParagraph(items[j])) break;
+                var txt = ParagraphText(items[j]);
+                var trim = txt.TrimStart();
+                if (j > start && !(IsMonospaceParagraph(items[j]) || trim.StartsWith("|") || IsJsonLine(trim))) break;
+                collected.Add(txt);
+            }
+            if (collected.Count == 0) return false;
+        }
+
+        var firstLine = collected.FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.TrimStart() ?? string.Empty;
+        if ((firstLine.StartsWith("{") || firstLine.StartsWith("[")) && JsonKey.IsMatch(string.Join("\n", collected)))
+        {
+            lang = "json";
+        }
+
+        lines = collected;
+        i = j - 1;
+        return true;
+    }
+
+    // True when the paragraph is a plain text block (no list marker, table, image, or nested children)
+    // that carries at least some non-whitespace text.
+    private static bool IsTextParagraph(XElement oe)
     {
         if (oe.Element(One + "List") is not null) return false;
         if (oe.Element(One + "Table") is not null) return false;
@@ -380,16 +498,73 @@ public sealed class MarkdownRenderer
 
         var runs = oe.Elements(One + "T").ToList();
         if (runs.Count == 0) return false;
-        if (runs.All(t => string.IsNullOrWhiteSpace(HtmlToPlainText(t.Value)))) return false;
+        return runs.Any(t => !string.IsNullOrWhiteSpace(HtmlToPlainText(t.Value)));
+    }
 
+    // The paragraph's full plain text, concatenating its inline runs (a single logical line).
+    private static string ParagraphText(XElement oe) =>
+        string.Concat(oe.Elements(One + "T").Select(t => HtmlToPlainText(t.Value)));
+
+    // A paragraph is monospace when its own style or any run declares a known monospace font-family.
+    private static bool IsMonospaceParagraph(XElement oe)
+    {
+        if (!IsTextParagraph(oe)) return false;
+
+        var runs = oe.Elements(One + "T").ToList();
         var styleHaystack = ((string?)oe.Attribute("style") ?? string.Empty) + " " +
                             string.Concat(runs.Select(t => t.Value));
         styleHaystack = styleHaystack.ToLowerInvariant();
         return MonospaceFonts.Any(f => styleHaystack.Contains("font-family:" + f) || styleHaystack.Contains("font-family: " + f));
     }
 
-    private static string CodeText(XElement oe) =>
-        string.Join("\n", oe.Elements(One + "T").Select(t => HtmlToPlainText(t.Value)));
+    // A JSON-ish continuation line: starts with a bracket/brace or a quoted key/value.
+    private static bool IsJsonLine(string trimmed) =>
+        trimmed.Length > 0 && (trimmed[0] is '{' or '}' or '[' or ']' or '"');
+
+    private static readonly string[] KqlLeadKeywords =
+        { "let ", "union ", "search ", "print ", "range ", "datatable", "find ", "externaldata", "declare ", "set " };
+
+    // A KQL query's opening line: a leading tabular operator/keyword, or a bare (dotted) table identifier.
+    // Only used as a code anchor when the following line is a pipe, so the whitelist can stay generous.
+    private static bool IsKqlHead(string trimmed)
+    {
+        if (trimmed.Length == 0) return false;
+        var lower = trimmed.ToLowerInvariant();
+        if (KqlLeadKeywords.Any(k => lower.StartsWith(k))) return true;
+        return trimmed.All(c => char.IsLetterOrDigit(c) || c is '_' or '.');
+    }
+
+    // Reclaims a KQL query's opening table/operator line when it was emitted as the trailing line of the
+    // preceding prose paragraph (OneNote often glues the table name to the paragraph above the pipes via a
+    // soft line break). If the last emitted content line is a KQL head, it is removed from 'sb' and returned
+    // so the caller can make it the first line of the following code block.
+    private static bool TryReclaimKqlHead(StringBuilder sb, out string head)
+    {
+        head = string.Empty;
+        var text = sb.ToString();
+
+        // Find the end of the last non-whitespace content.
+        int end = text.Length;
+        while (end > 0 && (text[end - 1] is '\n' or '\r' or ' ' or '\t')) end--;
+        if (end == 0) return false;
+
+        int lineStart = text.LastIndexOf('\n', end - 1);
+        var candidate = text.Substring(lineStart + 1, end - (lineStart + 1)).Trim();
+
+        // Keep it conservative: a single short token/keyword line, never a hard-broken emphasis/list line.
+        if (candidate.Length == 0 || candidate.Length > 60) return false;
+        if (candidate.Contains('*') || candidate.Contains('[') || candidate.Contains('`')) return false;
+        if (!IsKqlHead(candidate)) return false;
+
+        // Drop the reclaimed line (and any trailing blank/hard-break lines) and re-terminate the paragraph.
+        int cut = lineStart < 0 ? 0 : lineStart;
+        while (cut > 0 && (sb[cut - 1] is '\n' or '\r' or ' ' or '\t')) cut--;
+        sb.Length = cut;
+        if (sb.Length > 0) sb.Append("\n\n");
+
+        head = candidate;
+        return true;
+    }
 
     // ---- helpers (ported from onenote-mcp) ---------------------------------
 
@@ -498,10 +673,21 @@ public sealed class MarkdownRenderer
             // Don't wrap whitespace-only runs; that produces invalid emphasis markers.
             if (!string.IsNullOrWhiteSpace(content))
             {
-                if (italic) content = $"*{content}*";
-                if (bold) content = $"**{content}**";
-                if (strike) content = $"~~{content}~~";
-                if (highlight) content = WrapHighlight(content, _highlight);
+                // Markdown emphasis is inactive when a marker is adjacent to whitespace (e.g. "**ABC **"),
+                // so keep any leading/trailing whitespace outside the markers.
+                int s = 0, e = content.Length;
+                while (s < e && char.IsWhiteSpace(content[s])) s++;
+                while (e > s && char.IsWhiteSpace(content[e - 1])) e--;
+                var lead = content.Substring(0, s);
+                var core = content.Substring(s, e - s);
+                var trail = content.Substring(e);
+
+                if (italic) core = $"*{core}*";
+                if (bold) core = $"**{core}**";
+                if (strike) core = $"~~{core}~~";
+                if (highlight) core = WrapHighlight(core, _highlight);
+
+                content = lead + core + trail;
             }
             sb.Append(content);
         }

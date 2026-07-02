@@ -204,11 +204,14 @@ public sealed class Exporter
         }
     }
 
-    // First 20 characters of a page's base name, used to make extracted asset file names readable.
+    // A short, link-safe token derived from a page's base name, used to make extracted asset file names
+    // readable. Special characters (brackets, parentheses, ...) are dropped first so they can never leak
+    // into an image/attachment file name and break the Markdown link that embeds it.
     private static string PagePrefix(string baseName)
     {
-        var prefix = baseName.Length <= 20 ? baseName : baseName[..20];
-        return prefix.TrimEnd(' ', '.');
+        var simple = FileNaming.ToAssetPrefix(baseName);
+        var prefix = simple.Length <= 20 ? simple : simple[..20];
+        return prefix.TrimEnd(' ', '.', '-', '_');
     }
 
     private void WritePage(PageNode page, string dir, string fileBaseName, string pagePrefix, string sourcePath, FolderAssets assets)

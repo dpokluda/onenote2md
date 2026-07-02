@@ -100,6 +100,24 @@ public static class FileNaming
         return candidate;
     }
 
+    /// <summary>
+    /// Reduces a base name to a simple, link-safe token for use in extracted asset (image/attachment)
+    /// file names: keeps letters, digits, spaces, <c>-</c> and <c>_</c>, drops everything else (brackets,
+    /// parentheses, dots, <c>#</c>, ...), and collapses whitespace. This keeps asset file names clean and
+    /// safe to embed inside Markdown <c>](path)</c> links, where characters like <c>[]()</c> break parsing.
+    /// </summary>
+    /// <param name="baseName">The (already filesystem-safe) base name to simplify.</param>
+    /// <returns>A simplified token containing only letters, digits, spaces, <c>-</c> and <c>_</c>.</returns>
+    public static string ToAssetPrefix(string baseName)
+    {
+        var sb = new StringBuilder(baseName.Length);
+        foreach (var ch in baseName)
+        {
+            if (char.IsLetterOrDigit(ch) || ch is ' ' or '-' or '_') sb.Append(ch);
+        }
+        return CollapseWhitespace(sb.ToString()).Trim();
+    }
+
     private static string Preserve(string title)
     {
         var sb = new StringBuilder(title.Length);
