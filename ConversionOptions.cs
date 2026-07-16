@@ -18,6 +18,14 @@ public sealed class ConversionOptions
     /// </summary>
     public string? SectionLink { get; init; }
 
+    /// <summary>
+    /// Hierarchical OneNote path to a single page to export, e.g. "Notebook/Group/Section/Page Title".
+    /// The final segment is the page title; everything before it identifies the containing section.
+    /// Any sub-pages of the page are exported too. Mutually exclusive with <see cref="SectionPath"/>
+    /// and <see cref="SectionLink"/>.
+    /// </summary>
+    public string? PagePath { get; init; }
+
     /// <summary>Root output folder; its contents mirror the children of <see cref="SectionPath"/>.</summary>
     public required string OutputDirectory { get; init; }
 

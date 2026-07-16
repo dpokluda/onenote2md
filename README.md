@@ -23,13 +23,13 @@ The resulting folder tree under the output directory mirrors the OneNote structu
 ## Design choices
 
 - **COM, not Graph.** Reuses the proven COM approach from `onenote-mcp`. All COM-facing helpers live in the `ComClient/` folder and the OneNote single-threaded apartment is serialized behind a lock.
-- **Path or link addressing.** Sections are referenced either by their hierarchical display path (`Notebook/Group/.../Section`) or by a OneNote **Copy Link** URL. Links are matched by the backing `.one` file (the section-id/page-id GUIDs in OneNote links do **not** match the COM hierarchy IDs, so the `.one` path and page name are used instead).
+- **Path or link addressing.** Sections are referenced either by their hierarchical display path (`Notebook/Group/.../Section`) or by a OneNote **Copy Link** URL. Intra-export page links are matched primarily by the target's OneNote **page-id GUID**: the exporter asks OneNote for each page's own hyperlink (via `GetHyperlinkToObject`) to learn its page-id GUID, then matches links by that GUID. This is reliable because the page-id GUID embedded in a link is stable across page renames — unlike the page *name* stored in the link, which is frequently truncated or out of date. (The COM *hierarchy* IDs are unrelated to the link GUIDs, so they can't be used directly.) A `.one` file + page name match is kept only as a fallback for links that carry no page-id GUID.
 - **Hierarchy preserved.** A section group exports as a nested folder tree; a single section exports as one folder of pages. A page that has sub-pages becomes a folder named after the page: the page's own content is written inside as `_index.md` (the leading underscore sorts it to the top) and its sub-pages sit beside it, e.g. `Investment/_index.md` next to `Investment/Short-term safe money assets.md`. The index file name is configurable with `--index-name`.
 - **Readable filenames.** Page and folder names default to the OneNote title with spaces preserved (`This is a sample page.md`) because that is the most readable and is handled natively by Obsidian, VS Code, and other Markdown tools. Names are always sanitized for the filesystem (illegal characters removed, reserved names avoided, length capped, duplicates de-duplicated). A `--filename-style` switch offers `kebab` or `snake` for users targeting static-site generators. The length cap is configurable with `--max-name-length` (default 120).
 - **Images in an `images/` sub-folder.** Extracted images are written into an `images/` sub-folder next to their page and named `{NNN}-{page name}.{ext}`, where `{NNN}` is a zero-padded counter that is unique *per folder*. The per-folder counter guarantees every image gets a distinct file name (fixing collisions where OneNote reuses image names). The `{page name}` portion is simplified to letters, digits, spaces, `-` and `_` (brackets, parentheses and other punctuation are dropped) so the file name stays clean and the Markdown image link always parses, even for pages whose titles contain characters like `[` or `]`. The sub-folder name is configurable with `--images-folder`. Each extracted image is shown beneath its page in the progress output (`Image: <file name>`).
 - **File attachments in an `attachments/` sub-folder.** Files inserted into a page (`<one:InsertedFile>` — zips, `.docx`, `.eml`, `.xml`, etc.) are extracted byte-for-byte into an `attachments/` sub-folder (created only when a page has attachments) and linked inline with their original file name. Extracted files are bit-identical to the originals, so a `.zip` remains a valid archive and a `.docx` remains a valid Word document. The sub-folder name is configurable with `--attachments-folder`. Each extracted attachment is shown beneath its page in the progress output (`Attachment:
   <file name>`).
-- **Intra-export links rewritten.** When a page links to another page that is part of the same export, the OneNote link is replaced with a **relative** Markdown link to that page's `.md` file (path segments are percent-encoded, so spaces and characters like parentheses don't break the link). Because the links are relative, the exported tree keeps working if it is moved or copied elsewhere. Targets are matched by the link's backing `.one` file plus the page **name**; links to pages outside the export (or whose stored link text no longer matches the current page name) are left as the original OneNote link. Each rewritten link is shown beneath its page in the progress output (`Link to: <target page>`), and the total is reported in the final summary (`... , N link(s) rewritten`).
+- **Intra-export links rewritten.** When a page links to another page that is part of the same export, the OneNote link is replaced with a **relative** Markdown link to that page's `.md` file (path segments are percent-encoded, so spaces and characters like parentheses don't break the link). Because the links are relative, the exported tree keeps working if it is moved or copied elsewhere. Targets are matched by the link's OneNote **page-id GUID** (with a `.one` file + page-name fallback), so links still resolve even when the link's stored page title is truncated or the target page was later renamed. Links to pages outside the export (other sections/notebooks) and links that point at a whole section are left as the original OneNote link. Each rewritten link is shown beneath its page in the progress output (`Link to: <target page>`), and the total is reported in the final summary (`... , N link(s) rewritten`).
 - **Nested lists as a flattened outline.** OneNote list nesting (via `<one:OEChildren>`) is rendered as flat paragraph lines with computed, literal outline markers rather than as real Markdown lists. This is deliberate: real Markdown lists require blocks nested inside an item (code fences, images) to be indented to the item's content column, which renderers handle inconsistently and which caused nesting and numbering to break whenever a code block appeared inside a list. With the flattened model each item is an ordinary line, so an interleaved code block or image renders normally and can never restart or swallow the list. Markers are:
   - **Bullets** by depth — `*`, `**`, `***`, … (emitted escaped as `\*` so the asterisks
     show literally instead of creating a Markdown bullet or bold run).
@@ -58,16 +58,19 @@ dotnet build onenote2md.sln
 ## Usage
 
 ```sh
-onenote2md --section "<OneNote path>" --output "<folder>" [options] onenote2md --section-link "<OneNote copy-link>" --output "<folder>" [options]
+onenote2md --section "<OneNote path>" --output "<folder>" [options]
+onenote2md --page "<OneNote path>/<Page title>" --output "<folder>" [options]
+onenote2md --section-link "<OneNote copy-link>" --output "<folder>" [options]
 ```
 
 ### Required arguments
 
-Specify the section to export with **exactly one** of `--section` or `--section-link`, plus `--output`.
+Specify what to export with **exactly one** of `--section`, `--page`, or `--section-link`, plus `--output`.
 
 | Option                   | Description                                                                 |
 | ------------------------ | --------------------------------------------------------------------------- |
-| `--section <path>`       | Hierarchical OneNote path to the section or section group to export, e.g. `Governance Vteam Notebook/Policy/On-Call`. |
+| `--section <path>`       | Hierarchical OneNote path to the section or section group to export, e.g. `Governance Vteam Notebook/Policy/On-Call`. As a convenience, if the path actually points at a page it is exported as a single page (prefer `--page` for that). |
+| `--page <path>`          | Hierarchical OneNote path to a single **page** to export, where the last segment is the page title, e.g. `Governance Vteam Notebook/Policy/On-Call/Sync delete subs in ARM with MG hierarchy`. Any sub-pages of the page are exported too. |
 | `--section-link <url>`   | A OneNote **Copy Link** URL (right-click a section tab or page in OneNote → *Copy Link to ...*). If the link points at a **page**, just that page and its sub-pages are exported; otherwise the whole **section** is exported. The backing `.one` file embedded in the link is matched against the open OneNote hierarchy. Both the `onenote:` protocol link and the SharePoint `Doc.aspx?...` web link are accepted (paste either, or both). |
 | `--output <dir>`         | Output folder; its contents mirror the OneNote subtree below the section.   |
 
@@ -103,6 +106,12 @@ Export a single TSG section with YAML front matter and no duplicate H1 title:
 
 ```sh
 onenote2md --section "Governance Vteam Notebook/Policy/On-Call" --output ".\tsg" --front-matter --no-title-heading
+```
+
+Export a single page (last path segment is the page title) plus any of its sub-pages:
+
+```sh
+onenote2md --page "Governance Vteam Notebook/Policy/On-Call/Sync delete subs in ARM with MG hierarchy" --output ".\one-page"
 ```
 
 Export by pasting a OneNote **Copy Link** instead of typing the path. A link to a section exports the whole section; a link to a page exports just that page and its sub-pages:

@@ -90,6 +90,33 @@ public sealed class OneNoteComClient
     }
 
     /// <summary>
+    /// Resolves a single page by its hierarchical display path, e.g.
+    /// "Notebook/Group/Section/Page Title". The final path segment is the page title; everything
+    /// before it identifies the containing section. The page's sub-pages (if any) are included.
+    /// </summary>
+    /// <param name="path">Hierarchical path whose last segment is the page title.</param>
+    /// <param name="sectionPath">On success, the display path of the page's containing section.</param>
+    /// <returns>The resolved page node, or <c>null</c> if the section or page cannot be found.</returns>
+    public PageNode? ResolvePageByPath(string path, out string sectionPath)
+    {
+        sectionPath = string.Empty;
+
+        var idx = path.LastIndexOf('/');
+        if (idx <= 0 || idx >= path.Length - 1) return null;
+
+        sectionPath = path[..idx].Trim();
+        var pageName = path[(idx + 1)..].Trim();
+        if (sectionPath.Length == 0 || pageName.Length == 0) return null;
+
+        var hierarchy = LoadHierarchy();
+        var element = ResolveElementByPath(hierarchy, sectionPath);
+        if (element is null || element.Name != One + "Section") return null;
+
+        var section = BuildSection(element);
+        return FindPageByName(section.Pages, pageName);
+    }
+
+    /// <summary>
     /// Resolves the supplied display path to a section or section group and builds the export
     /// subtree rooted at it. Returns <c>null</c> when the path cannot be found.
     /// </summary>
@@ -183,6 +210,30 @@ public sealed class OneNoteComClient
         {
             App.GetPageContent(pageId, out var xml, PageInfo.piBinaryData);
             return xml;
+        }
+    }
+
+    /// <summary>
+    /// Returns the stable <c>page-id</c> GUID that OneNote uses to identify this page in
+    /// <c>onenote:</c> hyperlinks, normalized to lowercase hex without braces. This is the reliable
+    /// key for matching links embedded in other pages, because those links carry only this GUID (not
+    /// the hierarchy page ID) and often an out-of-date, truncated page title.
+    /// </summary>
+    /// <param name="pageId">OneNote internal (hierarchy) page ID.</param>
+    /// <returns>The normalized page-id GUID, or <c>null</c> if OneNote could not produce a hyperlink.</returns>
+    public string? GetPageIdGuid(string pageId)
+    {
+        lock (_comLock)
+        {
+            try
+            {
+                App.GetHyperlinkToObject(pageId, string.Empty, out var hyperlink);
+                return OneNoteLink.ExtractPageIdGuid(hyperlink);
+            }
+            catch (COMException)
+            {
+                return null;
+            }
         }
     }
 

@@ -20,12 +20,19 @@ public sealed class Exporter
     private int _imageCount;
     private int _attachmentCount;
     private int _linkCount;
+    private int _missingImageCount;
+    private readonly List<string> _pagesWithMissingImages = new();
     private int _totalPages;
     private readonly string _indexBaseName;
 
     // Maps (section .one URL, page name) -> absolute output .md path for every exported page, so
     // intra-export OneNote links can be rewritten to relative Markdown paths.
     private Dictionary<(string OneFile, string PageName), string> _linkIndex = new();
+
+    // Maps a page's OneNote page-id GUID -> absolute output .md path. This is the primary, most
+    // reliable link key: intra-notebook links carry this GUID even when they omit the .one URL and
+    // their embedded page title is stale/truncated. Populated only when page-id lookup is available.
+    private Dictionary<string, string> _pageIdIndex = new();
 
     /// <summary>Initializes a new exporter.</summary>
     /// <param name="client">OneNote COM client used to fetch page content.</param>
@@ -97,6 +104,7 @@ public sealed class Exporter
         }
 
         _totalPages = CountPages(root);
+        _pageIdIndex = new Dictionary<string, string>();
         _linkIndex = BuildLinkIndex(root, outputDir);
 
         Console.WriteLine();
@@ -122,6 +130,22 @@ public sealed class Exporter
             _attachmentCount > 0 ? $", {_attachmentCount} attachment(s)" : string.Empty,
             _linkCount,
             _options.DryRun ? " (dry run, nothing written)" : string.Empty);
+
+        if (_missingImageCount > 0)
+        {
+            Console.WriteLine();
+            ConsoleEx.WriteLine(ConsoleColor.Red,
+                "Warning: {0} image(s) on {1} page(s) had no data available from OneNote and were left " +
+                "as '[missing image]' placeholders.", _missingImageCount, _pagesWithMissingImages.Count);
+            ConsoleEx.WriteLine(ConsoleColor.Yellow,
+                "This usually means the page's images are not fully downloaded locally (a cloud notebook). " +
+                "Open each page in the OneNote desktop app and scroll through it to the end so the images " +
+                "render, then re-run the export.");
+            foreach (var page in _pagesWithMissingImages)
+            {
+                ConsoleEx.WriteLine(ConsoleColor.Yellow, "  - {0}", page);
+            }
+        }
     }
 
     private void ExportGroup(SectionGroupNode group, string dir, string sourcePath)
@@ -241,6 +265,12 @@ public sealed class Exporter
             LinkResolver = href => ResolveInternalLink(href, filePath),
         });
 
+        if (rendered.MissingImageCount > 0)
+        {
+            _missingImageCount += rendered.MissingImageCount;
+            _pagesWithMissingImages.Add($"{Relative(filePath)} ({rendered.MissingImageCount} image(s))");
+        }
+
         if (!_options.DryRun)
         {
             File.WriteAllText(filePath, rendered.Markdown);
@@ -354,16 +384,31 @@ public sealed class Exporter
     private string? ResolveInternalLink(string href, string currentFile)
     {
         var target = OneNoteLink.Parse(href);
-        if (target?.PageName is null || target.OneFileUrl is null) return null;
+        if (target is null) return null;
 
-        var key = (NormalizeOneFile(target.OneFileUrl), target.PageName.ToLowerInvariant());
-        if (!_linkIndex.TryGetValue(key, out var targetFile)) return null;
+        string? targetFile = null;
+
+        // Primary: match on the page-id GUID, which is present in intra-notebook links even when they
+        // carry no .one URL and their embedded page title is stale/truncated.
+        if (target.PageId is not null)
+        {
+            _pageIdIndex.TryGetValue(target.PageId, out targetFile);
+        }
+
+        // Fallback: match on (section .one URL, page name) for links that lack a usable page-id GUID.
+        if (targetFile is null && target.PageName is not null && target.OneFileUrl is not null)
+        {
+            var key = (NormalizeOneFile(target.OneFileUrl), target.PageName.ToLowerInvariant());
+            _linkIndex.TryGetValue(key, out targetFile);
+        }
+
+        if (targetFile is null) return null;
 
         var rel = Path.GetRelativePath(Path.GetDirectoryName(currentFile)!, targetFile);
         var mdLink = ToMarkdownLink(rel);
 
         _linkCount++;
-        ReportLinkProgress(target.PageName, rel);
+        ReportLinkProgress(target.PageName ?? target.PageId ?? "(page)", rel);
 
         return mdLink;
     }
@@ -479,8 +524,17 @@ public sealed class Exporter
         }
     }
 
-    private static void AddToIndex(Dictionary<(string, string), string> index, PageNode page, string filePath)
+    private void AddToIndex(Dictionary<(string, string), string> index, PageNode page, string filePath)
     {
+        // Primary key: the page's stable page-id GUID, resolved via OneNote. Reliable across renames
+        // and independent of the .one URL, which many embedded links omit entirely.
+        var pageIdGuid = _client.GetPageIdGuid(page.Id);
+        if (pageIdGuid is not null)
+        {
+            _pageIdIndex.TryAdd(pageIdGuid, filePath);
+        }
+
+        // Fallback key: (section .one URL, page name), used when a link lacks a page-id GUID.
         if (page.OneFilePath is null) return;
         var key = (NormalizeOneFile(page.OneFilePath), page.Name.ToLowerInvariant());
         index.TryAdd(key, filePath);

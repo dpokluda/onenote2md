@@ -22,12 +22,50 @@ public static class OneNoteLink
 
         var (fullUrl, protocolPage) = ParseProtocolForm(link);
         var (relativePath, webPage) = ParseWebForm(link);
+        var pageId = ExtractPageIdGuid(link);
 
-        if (fullUrl is null && relativePath is null) return null;
+        // A OneNote page link is usable if it carries the section's .one reference OR a page-id GUID.
+        // Intra-notebook links often supply only "#PageName&section-id=...&page-id=..." with no .one
+        // URL at all, so the page-id GUID is what makes those resolvable.
+        if (fullUrl is null && relativePath is null && pageId is null) return null;
 
         // Prefer the page name from whichever form supplied one.
         var pageName = protocolPage ?? webPage;
-        return new OneNoteLinkTarget(fullUrl, relativePath, pageName);
+        return new OneNoteLinkTarget(fullUrl, relativePath, pageName, pageId);
+    }
+
+    /// <summary>
+    /// Extracts the OneNote <c>page-id</c> GUID from a link (or any string containing a
+    /// <c>page-id={...}</c> token), normalized to lowercase hex without braces. Handles both the
+    /// <c>onenote:</c> form (<c>&amp;page-id={GUID}&amp;</c>) and the SharePoint web form, whose
+    /// <c>wd=target(...)</c> value ends with the same page GUID as its final <c>|</c>-delimited segment.
+    /// Returns <c>null</c> when no page GUID can be found.
+    /// </summary>
+    public static string? ExtractPageIdGuid(string? link)
+    {
+        if (string.IsNullOrEmpty(link)) return null;
+
+        var decoded = WebUtility.UrlDecode(link);
+
+        var idx = decoded.IndexOf("page-id=", StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+        {
+            var rest = decoded[(idx + "page-id=".Length)..];
+            var end = FirstIndexOfAny(rest, '&', '}', ')', '\r', '\n', '\t', ' ');
+            // Include the closing brace in the captured span when the value is brace-wrapped.
+            if (end < rest.Length && rest[end] == '}') end++;
+            return NormalizeGuid(rest[..end]);
+        }
+
+        return null;
+    }
+
+    // Reduces a possibly brace-wrapped GUID string to lowercase hex with no braces or surrounding
+    // whitespace, so page GUIDs from different link forms compare equal.
+    private static string? NormalizeGuid(string? value)
+    {
+        value = value?.Trim().Trim('{', '}').Trim();
+        return string.IsNullOrEmpty(value) ? null : value.ToLowerInvariant();
     }
 
     // Parses "onenote:https://.../Section.one#PageName&section-id=...&page-id=...". The .one URL is
@@ -54,9 +92,10 @@ public static class OneNoteLink
             pageName = NormalizePageName(WebUtility.UrlDecode(fragment[..fragEnd]));
         }
 
+        // Keep the parsed page name even when no .one URL is present: intra-notebook links carry a
+        // "#PageName" fragment with only section-id/page-id and no .one URL, and the page name is still
+        // useful for progress reporting and as a fallback.
         var url = inline.EndsWith(".one", StringComparison.OrdinalIgnoreCase) ? inline : ExtractBasePath(rest);
-        if (url is null) return (null, null);
-
         return (url, pageName);
     }
 
@@ -126,4 +165,11 @@ public static class OneNoteLink
 /// <param name="OneFileUrl">Full <c>.one</c> file URL from an <c>onenote:</c> link, or <c>null</c>.</param>
 /// <param name="RelativeOnePath">Notebook-relative <c>.one</c> path from a web link, or <c>null</c>.</param>
 /// <param name="PageName">Target page name when the link points at a page, or <c>null</c> for a section link.</param>
-public sealed record OneNoteLinkTarget(string? OneFileUrl, string? RelativeOnePath, string? PageName);
+/// <param name="PageId">Normalized <c>page-id</c> GUID (lowercase, no braces) when the link targets a
+/// page, or <c>null</c>. This is the most reliable page identifier, since it survives page renames
+/// and is independent of the section's <c>.one</c> URL.</param>
+public sealed record OneNoteLinkTarget(
+    string? OneFileUrl,
+    string? RelativeOnePath,
+    string? PageName,
+    string? PageId = null);

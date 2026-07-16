@@ -6,7 +6,9 @@ namespace OneNote2Md;
 
 using Renderer;
 
-/// <summary>Console entry point: defines the command-line interface and runs the export.</summary>
+/// <summary>
+/// Console entry point: defines the command-line interface and runs the export.
+/// </summary>
 internal static class Program
 {
     /// <summary>
@@ -25,6 +27,11 @@ internal static class Program
             "A OneNote 'Copy Link' URL to the section to export. Use instead of --section; the backing " +
             ".one file is matched against the OneNote hierarchy.");
         sectionLinkOption.AddAlias("-l");
+
+        var pageOption = new Option<string?>("--page",
+            "Hierarchical OneNote path to a single page to export (e.g. 'Notebook/Group/Section/Page Title'). " +
+            "The last segment is the page title; any sub-pages are exported too.");
+        pageOption.AddAlias("-p");
 
         var outputOption = new Option<string>("--output",
             "Output folder; its contents mirror the OneNote subtree below --section.")
@@ -78,7 +85,7 @@ internal static class Program
 
         var root = new RootCommand("Export a OneNote section or section group to local Markdown files.")
         {
-            sectionOption, sectionLinkOption, outputOption, imagesOption, filenameStyleOption, subpagesOption,
+            sectionOption, sectionLinkOption, pageOption, outputOption, imagesOption, filenameStyleOption, subpagesOption,
             codeLanguageOption, frontMatterOption, noTitleHeadingOption, headingOffsetOption,
             overwriteOption, dryRunOption, verboseOption, highlightOption,
             imagesFolderOption, attachmentsFolderOption, indexNameOption, maxNameLengthOption,
@@ -91,6 +98,7 @@ internal static class Program
             {
                 SectionPath = parsed.GetValueForOption(sectionOption),
                 SectionLink = parsed.GetValueForOption(sectionLinkOption),
+                PagePath = parsed.GetValueForOption(pageOption),
                 OutputDirectory = parsed.GetValueForOption(outputOption)!,
                 Images = parsed.GetValueForOption(imagesOption),
                 FilenameStyle = parsed.GetValueForOption(filenameStyleOption),
@@ -124,10 +132,11 @@ internal static class Program
 
         var hasPath = !string.IsNullOrWhiteSpace(options.SectionPath);
         var hasLink = !string.IsNullOrWhiteSpace(options.SectionLink);
-        if (hasPath == hasLink)
+        var hasPage = !string.IsNullOrWhiteSpace(options.PagePath);
+        if ((hasPath ? 1 : 0) + (hasLink ? 1 : 0) + (hasPage ? 1 : 0) != 1)
         {
             ConsoleEx.WriteLine(ConsoleColor.Red,
-                "Error: specify exactly one of --section or --section-link.");
+                "Error: specify exactly one of --section, --section-link, or --page.");
             return 2;
         }
 
@@ -161,6 +170,23 @@ internal static class Program
                     ConsoleEx.WriteLine("Resolved link to section '{0}'.", sourcePath);
                 }
             }
+            else if (hasPage)
+            {
+                Console.WriteLine();
+                ConsoleEx.WriteLine(ConsoleColor.Yellow, "Fetching page '{0}'...", options.PagePath!);
+                var page = client.ResolvePageByPath(options.PagePath!, out sourcePath);
+                if (page is null)
+                {
+                    ConsoleEx.WriteLine(ConsoleColor.Red,
+                        "Error: Could not find a page at path '{0}'. The path's last segment must be a " +
+                        "page title and everything before it a section; make sure the notebook is open " +
+                        "in OneNote.", options.PagePath!);
+                    return 2;
+                }
+
+                root = page;
+                ConsoleEx.WriteLine("Resolved page '{0}/{1}'.", sourcePath, page.Name);
+            }
             else
             {
                 sourcePath = options.SectionPath!;
@@ -169,10 +195,25 @@ internal static class Program
                 root = client.ResolveTarget(sourcePath);
                 if (root is null)
                 {
-                    ConsoleEx.WriteLine(ConsoleColor.Red,
-                        "Error: Could not find a section or section group at path '{0}'. " +
-                        "Check the path and make sure the notebook is open in OneNote.", sourcePath);
-                    return 2;
+                    // Be forgiving: the path may actually point at a page. Fall back to a page export
+                    // rather than failing, so a page path passed to --section still works.
+                    var page = client.ResolvePageByPath(sourcePath, out var pageSectionPath);
+                    if (page is not null)
+                    {
+                        root = page;
+                        sourcePath = pageSectionPath;
+                        ConsoleEx.WriteLine(
+                            "Note: '{0}' is a page, not a section; exporting it as a single page. " +
+                            "(Use --page to be explicit.)", options.SectionPath!);
+                    }
+                    else
+                    {
+                        ConsoleEx.WriteLine(ConsoleColor.Red,
+                            "Error: Could not find a section or section group at path '{0}'. " +
+                            "Check the path and make sure the notebook is open in OneNote. " +
+                            "(To export a single page, use --page.)", sourcePath);
+                        return 2;
+                    }
                 }
             }
 

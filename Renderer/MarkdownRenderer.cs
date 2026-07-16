@@ -71,7 +71,7 @@ public sealed class MarkdownRenderer
             }
         }
 
-        return new RenderedPage(sb.ToString().TrimEnd() + "\n", images, attachments);
+        return new RenderedPage(sb.ToString().TrimEnd() + "\n", images, attachments, state.MissingImageCount);
     }
 
     private sealed class RenderState
@@ -89,6 +89,10 @@ public sealed class MarkdownRenderer
         public IReadOnlyDictionary<string, string> StyleMap { get; }
         public List<ExtractedImage> Images { get; }
         public List<ExtractedAttachment> Attachments { get; }
+
+        // Number of images that belong to the page but could not be written because OneNote returned
+        // no binary data for them (typically a cloud page whose images are not fully downloaded yet).
+        public int MissingImageCount { get; set; }
 
         // Tracks the current ordered-list marker token at each nesting depth (null for bullet levels),
         // used to build hierarchical numbers like "1.1" or "1.a" for the flattened outline.
@@ -139,7 +143,10 @@ public sealed class MarkdownRenderer
         else if (image is not null)
         {
             EnsureBlankLine(sb);
-            RenderImage(image, state, sb);
+            foreach (var img in oe.Elements(One + "Image"))
+            {
+                RenderImage(img, state, sb);
+            }
         }
         else if (insertedFile is not null)
         {
@@ -281,7 +288,11 @@ public sealed class MarkdownRenderer
         }
 
         var data = image.Element(One + "Data")?.Value;
-        if (string.IsNullOrWhiteSpace(data)) return;
+        if (string.IsNullOrWhiteSpace(data))
+        {
+            EmitMissingImage(state, sb);
+            return;
+        }
 
         byte[] bytes;
         try
@@ -290,6 +301,7 @@ public sealed class MarkdownRenderer
         }
         catch (FormatException)
         {
+            EmitMissingImage(state, sb);
             return;
         }
 
@@ -299,6 +311,16 @@ public sealed class MarkdownRenderer
 
         var altText = EscapeLinkText(Path.GetFileNameWithoutExtension(relativePath));
         sb.Append("![").Append(altText).Append("](").Append(ToAssetLink(relativePath)).Append(")\n\n");
+    }
+
+    // An image is part of the page but OneNote returned no binary data for it (common for cloud pages
+    // whose images have not been fully downloaded/rendered locally). Emit a visible placeholder rather
+    // than silently dropping it, and record it so the export can warn the user.
+    private static void EmitMissingImage(RenderState state, StringBuilder sb)
+    {
+        state.MissingImageCount++;
+        sb.Append("**[missing image \u2014 not downloaded from OneNote; open and scroll the page in the ")
+          .Append("OneNote desktop app, then re-run the export]**\n\n");
     }
 
     // Copies an embedded file (a OneNote InsertedFile) out via its local cache and links to it. The
